@@ -1,4 +1,5 @@
 # -*- mode: Python -*-
+# fork measurement harness (agarg21, campaign 243): touches the e2e path filter so in-fork PRs run E2E
 # Tiltfile for argo-workflows local dev and CI. Replaces kit/tasks.yaml.
 # Builds the controller, server and executor images and runs them in-cluster.
 # Dev (`tilt up`): binaries are compiled on the host and COPYed into small
