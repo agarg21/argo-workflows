@@ -244,9 +244,51 @@ jobs:
           path: tools-bin
           if-no-files-found: error
 
+  e2e-images:
+    name: E2E Images
+    needs: [ changed-files ]
+    # same condition as e2e-tools: both e2e-tests and e2e-ui load these images
+    if: ${{ needs.changed-files.outputs.e2e-tests == 'true' || needs.changed-files.outputs.ui == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        if: ${{ vars.disable_harden_runner != 'true' }}
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build production images once
+        # Every e2e leg used to build these same three images itself (Tiltfile
+        # --mode=ci); build them once here with the build args the Tiltfile
+        # computes, and let the legs load them (ARGO_E2E_PREBUILT=true).
+        run: |
+          args="--build-arg GIT_COMMIT=$(git rev-parse HEAD)"
+          args="$args --build-arg GIT_TAG=$(git describe --exact-match --tags --abbrev=0 2>/dev/null || echo untagged)"
+          tree_state=$([ -z "$(git status --porcelain)" ] && echo clean || echo dirty)
+          args="$args --build-arg GIT_TREE_STATE=$tree_state"
+          for t in workflow-controller argocli argoexec; do
+            docker build -f Dockerfile $args --target $t -t argo-e2e/$t:prebuilt .
+          done
+          mkdir -p /tmp/e2e-images
+          # the legs' tree is dirty (tools-bin), so their host-built ./dist/argo would
+          # report a different version than these images and the CLI would warn
+          # "CLI version does not match server version" into test output; the legs
+          # build their CLI with this tree state instead
+          echo "$tree_state" > /tmp/e2e-images/tree-state
+          docker save argo-e2e/workflow-controller:prebuilt argo-e2e/argocli:prebuilt argo-e2e/argoexec:prebuilt | gzip -1 > /tmp/e2e-images/images.tar.gz
+      - name: Upload images
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-images
+          path: /tmp/e2e-images
+          if-no-files-found: error
+          retention-days: 1
+
   e2e-tests:
     name: E2E Tests
-    needs: [ changed-files, e2e-tools ]
+    needs: [ changed-files, e2e-tools, e2e-images ]
     if: ${{ needs.changed-files.outputs.e2e-tests == 'true' }}
     runs-on: ubuntu-24.04
     # These tests usually finish in ~25m, but occasionally they take much longer due to resource
@@ -385,7 +427,16 @@ jobs:
         with:
           k8s-version: ${{ matrix.k8s_version || 'max' }}
           cli-auth-kubeconfig: "true"
+      - name: Load prebuilt images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-images
+          path: /tmp/e2e-images
+      - name: Import prebuilt images into docker
+        run: gunzip -c /tmp/e2e-images/images.tar.gz | docker load
       - name: Build images and start Argo in-cluster
+        env:
+          ARGO_E2E_PREBUILT: "true"
         # tilt builds the production images, deploys them, and then keeps
         # running through the test steps so its port-forwards (argo-server,
         # minio, databases) keep serving the tests over localhost. `tilt wait`
@@ -418,7 +469,7 @@ jobs:
           # don't default in the expression: `matrix.retries || '2'` would turn
           # an explicit `retries: 0` into 2, because 0 is falsy
           MATRIX_RETRIES: ${{ matrix.retries }}
-        run: make ${{matrix.test}} E2E_SUITE_TIMEOUT=30m STATIC_FILES=false INITLESS=${{ matrix.initless || 'false' }} TEST_RETRIES="${MATRIX_RETRIES:-2}"
+        run: make ${{matrix.test}} E2E_SUITE_TIMEOUT=30m STATIC_FILES=false INITLESS=${{ matrix.initless || 'false' }} TEST_RETRIES="${MATRIX_RETRIES:-2}" GIT_TREE_STATE="$(cat /tmp/e2e-images/tree-state)"
       - name: Upload test results
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -459,7 +510,7 @@ jobs:
         # see https://github.com/orgs/community/discussions/9141#discussioncomment-2296809 and https://github.com/orgs/community/discussions/26822#discussioncomment-3305794
   e2e-tests-composite-result:
     name: E2E Tests - Composite result
-    needs: [ e2e-tools, e2e-tests, e2e-ui ]
+    needs: [ e2e-tools, e2e-images, e2e-tests, e2e-ui ]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     steps:
@@ -471,10 +522,11 @@ jobs:
 
       - run: |
           tools="${{ needs.e2e-tools.result }}"
+          images="${{ needs.e2e-images.result }}"
           result="${{ needs.e2e-tests.result }}"
           ui="${{ needs.e2e-ui.result }}"
           # a tools failure skips the dependent jobs, which must not count as a pass
-          if [[ $tools == "failure" ]]; then
+          if [[ $tools == "failure" || $images == "failure" ]]; then
             exit 1
           fi
           # mark as successful even if skipped (e.g. a PR that touches neither)
@@ -589,7 +641,7 @@ jobs:
 
   e2e-ui:
     name: E2E UI (${{ matrix.name }})
-    needs: [ changed-files, e2e-tools ]
+    needs: [ changed-files, e2e-tools, e2e-images ]
     if: ${{ needs.changed-files.outputs.ui == 'true' || needs.changed-files.outputs.e2e-tests == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -635,7 +687,16 @@ jobs:
         run: |
           yarn --cwd ui install
           yarn --cwd ui playwright install --with-deps chromium
+      - name: Load prebuilt images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: e2e-images
+          path: /tmp/e2e-images
+      - name: Import prebuilt images into docker
+        run: gunzip -c /tmp/e2e-images/images.tar.gz | docker load
       - name: Build images and start Argo in-cluster
+        env:
+          ARGO_E2E_PREBUILT: "true"
         # tilt builds the production images (UI baked in), deploys them, and keeps
         # its argo-server port-forward (:2746) serving through the test steps.
         run: |

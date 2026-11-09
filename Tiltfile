@@ -1,4 +1,5 @@
 # -*- mode: Python -*-
+# fork measurement harness (agarg21, campaign 243): touches the e2e path filter so in-fork PRs run E2E
 # Tiltfile for argo-workflows local dev and CI. Replaces kit/tasks.yaml.
 # Builds the controller, server and executor images and runs them in-cluster.
 # Dev (`tilt up`): binaries are compiled on the host and COPYed into small
@@ -198,9 +199,19 @@ def k3d_import(images):
     imp = 'k3d image import --mode direct -c %s %s' % (cluster, images)
     return '(%s || (sleep 5 && %s))' % (imp, imp)
 
+# CI can build the production images once in a separate job and load them into
+# each e2e leg (ARGO_E2E_PREBUILT=true): the build is then a re-tag of the loaded
+# image, identical across the matrix, instead of ~7 min of docker build per leg.
+PREBUILT = is_ci and os.getenv('ARGO_E2E_PREBUILT', '') == 'true'
+
+def image_cmd(target, tag):
+    if PREBUILT:
+        return 'docker tag argo-e2e/%s:prebuilt %s' % (target, tag)
+    return 'docker build -f Dockerfile %s --target %s -t %s .' % (BUILD_ARGS, target, tag)
+
 def k3d_build(ref, target, deps, prebuild=None, canonical=None):
     steps = ([prebuild] if prebuild else []) + [
-        'docker build -f Dockerfile %s --target %s -t $EXPECTED_REF .' % (BUILD_ARGS, target),
+        image_cmd(target, '$EXPECTED_REF'),
     ]
     images = '$EXPECTED_REF'
     if canonical:
@@ -258,13 +269,13 @@ if api:
     k3d_build(IMAGE_NS + '/argocli', cli_target, cli_deps, canonical=CLI_CANONICAL)
 else:
     cli_cmd = ' && '.join(([cli_prebuild] if cli_prebuild else []) + [
-        'docker build -f Dockerfile %s --target %s -t %s .' % (BUILD_ARGS, cli_target, CLI_CANONICAL),
+        image_cmd(cli_target, CLI_CANONICAL),
         k3d_import(CLI_CANONICAL),
     ])
     local_resource('argocli-image', cmd=cli_cmd, deps=cli_deps, labels=['images'])
 
 exec_cmd = ' && '.join(([exec_prebuild] if exec_prebuild else []) + [
-    'docker build -f Dockerfile %s --target %s -t %s/argoexec:latest .' % (BUILD_ARGS, exec_target, IMAGE_NS),
+    image_cmd(exec_target, '%s/argoexec:latest' % IMAGE_NS),
     k3d_import('%s/argoexec:latest' % IMAGE_NS),
 ])
 local_resource('argoexec-image', cmd=exec_cmd, deps=exec_src, labels=['images'])
